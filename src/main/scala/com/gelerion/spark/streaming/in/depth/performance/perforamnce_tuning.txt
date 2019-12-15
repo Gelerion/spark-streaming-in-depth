@@ -1,0 +1,105 @@
+Scheduling Delay and Processing Delay
+=========================================
+ - processing delay
+This purely computational time is accounted for under the name of processing delay, which is the difference between
+the time elapsed running the job and the time elapsed setting it up.
+
+ - scheduling delay
+Scheduling delay, on the other hand, accounts for the time necessary in taking the job definition (often a closure),
+serializing it, and sending it to an executor that will need to process it. Naturally, this distribution of tasks
+implies some overhead—time that is not spent computing—so it’s wise not to decompose our workload into too many
+small jobs and to tune the parallelism so that it is commensurate with the number of executors on our cluster.
+Finally, the scheduling delay also accounts for job lateness, if our Spark Streaming cluster has accumulated jobs
+on its queue. It is formally defined as the time between the entrance of the job (RDD) in the job queue, and
+the moment Spark Streaming actually begins computation.
+
+ - spark.locality.wait
+Another important factor influencing scheduling delay are the locality settings, in particular spark.locality.wait,
+which dictates how long to wait for the most local placement of the task with relation to the data before escalating to the next locality level.
+
+Checkpoint Influence in Processing Time
+=========================================
+The usual checkpointing on a stateful stream for which checkpoints are usually significant, in terms of semantics and
+in the size of the safeguarded data, can take an amount of time much larger than a batch interval.
+Checkpointing durations on the order of 10 batch intervals is not unheard of. As a consequence, when making
+sure that the average batch-processing time is less than the batch interval, it’s necessary to take checkpointing into account.
+The contribution of checkpointing to the average batch-processing time is as follows:
+
+  checkpointing delay
+  --------------------- * checkpointing duration
+  batch interval
+
+
+This should be added to the average computation time observed during a non checkpointing job to have an idea of the r
+eal batch-processing time. Alternatively, another way to proceed is to compute how much time we have left in our budget
+(the difference between batch interval and batch-processing time) without checkpointing and tune the checkpointing
+interval in a function:
+
+ checkpointing delay ≥ checkpointing duration / (batch interval − batch processing time*)
+
+Where * marks the measure of the batch-processing time without checkpointing.
+
+Limiting the Data Ingress with Fixed-Rate Throttling
+====================================================
+
+ - spark.streaming.receiver.maxRate
+We can set this by adding spark.streaming.receiver.maxRate to a value in elements per second in your Spark configuration.
+Note that for the receiver-based consumers, this limitation is enforced at block creation and simply refuses
+to read any more elements from the data source if the throttle limit has been reached.
+
+ - spark.streaming.kafka.maxRatePerPartition
+spark.streaming.kafka.maxRatePerPartition that sets the max rate limit per partition in the topic in records per second.
+    maxRatePerPartition * partitionsPerTopic * batchInterval
+
+Backpressure
+====================================================
+The queue-based system we have described with fixed-rate throttling has the disadvantage that it makes it obscure
+for our entire pipeline to understand where inefficiencies lie. Indeed, we have considered a data source (e.g., a TCP socket)
+that consists of reading data from an external server (e.g., an HTTP server), into a local system-level queue (a TCP buffer),
+before Spark feeds this data in an application-level buffer (Spark Streaming’s RDDs). Unless we use a listener tied
+to our Spark Streaming receiver, it is challenging to detect and diagnose that our system is congested and, if so,
+where the congestion occurs.
+The upstream-flowing, quantified signal about congestion is called backpressure. This is a continuous signaling
+that explicitly says how many elements the system in question (here, our Spark Streaming cluster) can be expected
+to process at this specific instant.
+
+Dynamic Throttling
+====================================================
+In Spark Streaming, dynamic throttling is regulated by default with a Proportional-Integral-Derivative (PID) controller.
+ - PID (https://richardstartin.github.io/posts/tuning-spark-back-pressure-by-simulation)
+Observes an error signal as the difference between the latest ingestion rate,
+observed on a batch interval in terms of number of elements per second, and the processing rate,
+which is the number of elements that have been processed per second.
+
+The PID controller then aims at regulating the number of ingested elements on the next batch interval by taking into account the following:
+ - A proportional term (the error at this instant)
+ - An integral or “historic” term (the sum of all errors in the past; here, the number of unprocessed elements lying in the queue)
+ - A derivative or “speed” term (the rate at which the number of elements has been diminishing in the past)
+
+Backpressure-based dynamic throttling in Spark can be turned on by setting:
+ - spark.streaming.backpressure.enabled
+ - spark.streaming.backpressure.initialRate (dictates the number of elements per second the throttling should initially expect)
+
+proportional term - helps with dealing with the current snapshot of the error
+integral term - helps the system to deal with the accumulated error until now
+derivative term - helps the system either avoid overshooting for cases in which it is correcting too fast,
+                  or undercorrection in case we face a brutal spike in the throughput of stream elements.
+
+
+Each of the terms of the PID has a weight factor attached to it, between 0 and 1, as befits a classical
+implementation of PIDs. Here are the parameters that you need to set in your Spark configuration:
+spark.streaming.backpressure.pid.proportional
+spark.streaming.backpressure.pid.integral
+spark.streaming.backpressure.pid.derived
+
+Speculative Execution
+====================================================
+- spark.speculation
+- spark.speculation.interval  100ms  How often Spark will check for tasks to speculate
+- spark.speculation.multiplier 1.5 How many times slower a task is than the median to be considered for speculation
+- spark.speculation.quantile 0.75 Fraction of tasks that must be complete before speculation is enabled for a particular stage
+
+
+
+
+
